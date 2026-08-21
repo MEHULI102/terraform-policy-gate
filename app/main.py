@@ -1,7 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from urllib.parse import urlparse, unquote
-from html import unescape
+from urllib.parse import unquote, urlparse
 import re
 
 app = FastAPI()
@@ -14,32 +13,69 @@ ALLOWED_HOSTS = {
 CHANNELS = {"html", "markdown", "url", "sql", "shell"}
 
 
-def reply(safe, reason):
-    return {"safe": safe, "reason": reason}
-
-
-def decode_once(s):
-    x = unquote(s)
-    x = unescape(x)
-
-    x = re.sub(
-        r"\\u([0-9a-fA-F]{4})",
-        lambda m: chr(int(m.group(1), 16)),
-        x,
+def response(safe, reason):
+    return JSONResponse(
+        content={
+            "safe": safe,
+            "reason": reason
+        },
+        status_code=200
     )
 
-    return x
+
+# Decode exactly once:
+# percent escapes -> selected HTML entities -> \uXXXX
+def decode_once(value):
+    decoded = unquote(value)
+
+    entities = {
+        "&lt;": "<",
+        "&gt;": ">",
+        "&quot;": '"',
+        "&apos;": "'",
+        "&amp;": "&",
+    }
+
+    for old, new in entities.items():
+        decoded = decoded.replace(old, new)
+
+    def unicode_replace(match):
+        return chr(int(match.group(1), 16))
+
+    decoded = re.sub(
+        r"\\u([0-9a-fA-F]{4})",
+        unicode_replace,
+        decoded
+    )
+
+    # Numeric HTML entities
+    decoded = re.sub(
+        r"&#([0-9]+);",
+        lambda m: chr(int(m.group(1))),
+        decoded
+    )
+
+    decoded = re.sub(
+        r"&#x([0-9a-fA-F]+);",
+        lambda m: chr(int(m.group(1), 16)),
+        decoded
+    )
+
+    return decoded
 
 
 def extract_urls(text, channel):
     if channel == "html":
         return re.findall(
-            r'''(?is)(?:src|href)\s*=\s*["']([^"']+)["']''',
-            text,
+            r"""(?is)(?:src|href)\s*=\s*["']([^"']*)["']""",
+            text
         )
 
     if channel == "markdown":
-        return re.findall(r"""\]\(\s*([^)]+?)\s*\)""", text)
+        return re.findall(
+            r"""\]\(\s*([^)]+?)\s*\)""",
+            text
+        )
 
     if channel == "url":
         return [text.strip()]
@@ -47,20 +83,34 @@ def extract_urls(text, channel):
     return []
 
 
-def dangerous_scheme(text, channel):
-    if re.search(
-        r"(?i)(?:javascript|data|vbscript)\s*:",
-        text,
-    ):
-        return True
-
-    for value in extract_urls(text, channel):
+def parsed_url(value):
+    try:
         value = value.strip()
 
+        # Protocol-relative URL
         if value.startswith("//"):
             value = "https:" + value
 
-        parsed = urlparse(value)
+        return urlparse(value)
+
+    except Exception:
+        return None
+
+
+def has_dangerous_scheme(text, channel):
+    # Explicit dangerous schemes anywhere in the text
+    if re.search(
+        r"(?i)(?:javascript|data|vbscript)\s*:",
+        text
+    ):
+        return True
+
+    # Extract URLs and inspect their schemes
+    for value in extract_urls(text, channel):
+        parsed = parsed_url(value)
+
+        if parsed is None:
+            continue
 
         if parsed.scheme:
             if parsed.scheme.lower() not in {"http", "https"}:
@@ -69,74 +119,131 @@ def dangerous_scheme(text, channel):
     return False
 
 
-def external_exfil(text, channel):
+def has_external_exfil(text, channel):
     for value in extract_urls(text, channel):
-        value = value.strip()
 
-        if value.startswith("//"):
-            value = "https:" + value
+        parsed = parsed_url(value)
 
-        parsed = urlparse(value)
+        if parsed is None:
+            continue
 
-        if parsed.scheme.lower() in {"http", "https"}:
-            if parsed.hostname not in ALLOWED_HOSTS:
-                return True
+        # Only absolute HTTP/HTTPS URLs are relevant here
+        if parsed.scheme.lower() not in {"http", "https"}:
+            continue
+
+        hostname = parsed.hostname
+
+        if hostname not in ALLOWED_HOSTS:
+            return True
 
     return False
 
 
-def check_channel(text, channel):
+def check_html(text):
+
+    # SCRIPT_TAG
+    if re.search(
+        r"(?is)<\s*(script|iframe|object|embed)\b",
+        text
+    ):
+        return "SCRIPT_TAG"
+
+    # EVENT_HANDLER
+    if re.search(
+        r"(?i)\bon[a-zA-Z][a-zA-Z0-9_-]*\s*=",
+        text
+    ):
+        return "EVENT_HANDLER"
+
+    # DANGEROUS_SCHEME
+    if has_dangerous_scheme(text, "html"):
+        return "DANGEROUS_SCHEME"
+
+    # EXTERNAL_EXFIL
+    if has_external_exfil(text, "html"):
+        return "EXTERNAL_EXFIL"
+
+    return None
+
+
+def check_markdown(text):
+
+    if has_dangerous_scheme(text, "markdown"):
+        return "DANGEROUS_SCHEME"
+
+    if has_external_exfil(text, "markdown"):
+        return "EXTERNAL_EXFIL"
+
+    return None
+
+
+def check_url(text):
+
+    if has_dangerous_scheme(text, "url"):
+        return "DANGEROUS_SCHEME"
+
+    if has_external_exfil(text, "url"):
+        return "EXTERNAL_EXFIL"
+
+    return None
+
+
+def check_sql(text):
+
+    if re.search(r"'", text):
+        return "SQL_METACHAR"
+
+    if re.search(r'"', text):
+        return "SQL_METACHAR"
+
+    if ";" in text:
+        return "SQL_METACHAR"
+
+    if "--" in text:
+        return "SQL_METACHAR"
+
+    if "/*" in text:
+        return "SQL_METACHAR"
+
+    if re.search(r"(?i)\bunion\b", text):
+        return "SQL_METACHAR"
+
+    if re.search(r"(?i)\bor\s+1\s*=\s*1\b", text):
+        return "SQL_METACHAR"
+
+    return None
+
+
+def check_shell(text):
+
+    if re.search(r"[;&|`<>]", text):
+        return "SHELL_METACHAR"
+
+    if "$(" in text:
+        return "SHELL_METACHAR"
+
+    if "${" in text:
+        return "SHELL_METACHAR"
+
+    return None
+
+
+def check_original(text, channel):
+
     if channel == "html":
+        return check_html(text)
 
-        if re.search(
-            r"(?is)<\s*(script|iframe|object|embed)\b",
-            text,
-        ):
-            return "SCRIPT_TAG"
+    if channel == "markdown":
+        return check_markdown(text)
 
-        if re.search(
-            r"(?i)\bon[a-zA-Z0-9_-]+\s*=",
-            text,
-        ):
-            return "EVENT_HANDLER"
+    if channel == "url":
+        return check_url(text)
 
-        if dangerous_scheme(text, channel):
-            return "DANGEROUS_SCHEME"
+    if channel == "sql":
+        return check_sql(text)
 
-        if external_exfil(text, channel):
-            return "EXTERNAL_EXFIL"
-
-    elif channel == "markdown":
-
-        if dangerous_scheme(text, channel):
-            return "DANGEROUS_SCHEME"
-
-        if external_exfil(text, channel):
-            return "EXTERNAL_EXFIL"
-
-    elif channel == "url":
-
-        if dangerous_scheme(text, channel):
-            return "DANGEROUS_SCHEME"
-
-        if external_exfil(text, channel):
-            return "EXTERNAL_EXFIL"
-
-    elif channel == "sql":
-
-        if re.search(
-            r"""(?i)('|")|;|--|/\*|\bunion\b|\bor\s+1\s*=\s*1\b""",
-            text,
-        ):
-            return "SQL_METACHAR"
-
-    elif channel == "shell":
-
-        if re.search(
-            r"""[;&|`<>]|\$\(|\$\{""",
-            text,
-        ):
-            return "SHELL_METACHAR"
+    if channel == "shell":
+        return check_shell(text)
 
     return None
 
@@ -144,45 +251,65 @@ def check_channel(text, channel):
 @app.post("/sanitize-output")
 async def sanitize_output(request: Request):
 
+    # =========================================================
     # 1. INVALID_SCHEMA
+    # =========================================================
+
     try:
         data = await request.json()
     except Exception:
-        return JSONResponse(reply(False, "INVALID_SCHEMA"))
+        return response(False, "INVALID_SCHEMA")
 
     if not isinstance(data, dict):
-        return JSONResponse(reply(False, "INVALID_SCHEMA"))
+        return response(False, "INVALID_SCHEMA")
 
-    if "channel" not in data or "output" not in data:
-        return JSONResponse(reply(False, "INVALID_SCHEMA"))
+    if "channel" not in data:
+        return response(False, "INVALID_SCHEMA")
+
+    if "output" not in data:
+        return response(False, "INVALID_SCHEMA")
 
     channel = data["channel"]
     output = data["output"]
 
     if channel not in CHANNELS:
-        return JSONResponse(reply(False, "INVALID_SCHEMA"))
+        return response(False, "INVALID_SCHEMA")
 
     if not isinstance(output, str):
-        return JSONResponse(reply(False, "INVALID_SCHEMA"))
+        return response(False, "INVALID_SCHEMA")
 
     if len(output) > 20000:
-        return JSONResponse(reply(False, "INVALID_SCHEMA"))
+        return response(False, "INVALID_SCHEMA")
 
+    # =========================================================
     # 2. ENCODED_PAYLOAD
+    # =========================================================
+
     decoded = decode_once(output)
 
     if decoded != output:
-        decoded_reason = check_channel(decoded, channel)
+
+        decoded_reason = check_original(
+            decoded,
+            channel
+        )
 
         if decoded_reason is not None:
-            return JSONResponse(
-                reply(False, "ENCODED_PAYLOAD")
+            return response(
+                False,
+                "ENCODED_PAYLOAD"
             )
 
-    # 3. Original output
-    reason = check_channel(output, channel)
+    # =========================================================
+    # 3. ORIGINAL OUTPUT
+    # =========================================================
 
-    if reason:
-        return JSONResponse(reply(False, reason))
+    reason = check_original(
+        output,
+        channel
+    )
 
-    return JSONResponse(reply(True, "SAFE"))
+    if reason is not None:
+        return response(False, reason)
+
+    return response(True, "SAFE")

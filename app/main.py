@@ -12,29 +12,22 @@ REQUIRED_LABELS = {
 }
 
 ALLOWED_BACKENDS = {"gcs", "s3", "azurerm", "remote"}
-STATEFUL_TYPES = {
-    "storage_bucket",
-    "sql_database",
-    "persistent_disk",
-}
-
-VALID_ACTIONS = {"create", "update", "delete"}
+ALLOWED_ACTIONS = {"create", "update", "delete"}
+STATEFUL_TYPES = {"storage_bucket", "sql_database", "persistent_disk"}
+ALLOWED_PROVIDERS = {"6.2.1", "= 6.2.1", "~> 6.0"}
 
 
 def reject(reason):
     return JSONResponse(
         {"decision": "reject", "reason": reason},
-        status_code=200,
+        status_code=200
     )
 
 
 @app.post("/terraform/plan")
 async def terraform_plan(request: Request):
 
-    # -------------------------------------------------
-    # 1. INVALID_PLAN
-    # -------------------------------------------------
-
+    # 1. Request must be valid JSON object
     try:
         data = await request.json()
     except Exception:
@@ -52,11 +45,14 @@ async def terraform_plan(request: Request):
         "resource",
     }
 
-    if not required.issubset(data):
+    if not required.issubset(data.keys()):
         return reject("INVALID_PLAN")
 
     # Top-level types
     if not isinstance(data["environment"], str):
+        return reject("INVALID_PLAN")
+
+    if not isinstance(data["state"], dict):
         return reject("INVALID_PLAN")
 
     if not isinstance(data["providerVersion"], str):
@@ -65,16 +61,13 @@ async def terraform_plan(request: Request):
     if not isinstance(data["destroyApproved"], bool):
         return reject("INVALID_PLAN")
 
-    if not isinstance(data["state"], dict):
-        return reject("INVALID_PLAN")
-
     if not isinstance(data["resource"], dict):
         return reject("INVALID_PLAN")
 
     state = data["state"]
     resource = data["resource"]
 
-    # State fields must exist and have correct types
+    # State schema
     if "backend" not in state or "locked" not in state:
         return reject("INVALID_PLAN")
 
@@ -84,7 +77,7 @@ async def terraform_plan(request: Request):
     if not isinstance(state["locked"], bool):
         return reject("INVALID_PLAN")
 
-    # Resource fields must exist
+    # Resource required fields
     resource_required = {
         "address",
         "type",
@@ -94,7 +87,7 @@ async def terraform_plan(request: Request):
         "forceDestroy",
     }
 
-    if not resource_required.issubset(resource):
+    if not resource_required.issubset(resource.keys()):
         return reject("INVALID_PLAN")
 
     # Resource types
@@ -107,12 +100,13 @@ async def terraform_plan(request: Request):
     if not isinstance(resource["action"], str):
         return reject("INVALID_PLAN")
 
+    if resource["action"] not in ALLOWED_ACTIONS:
+        return reject("INVALID_PLAN")
+
     if not isinstance(resource["labels"], dict):
         return reject("INVALID_PLAN")
 
-    if resource["secret"] is not None and not isinstance(
-        resource["secret"], str
-    ):
+    if resource["secret"] is not None and not isinstance(resource["secret"], str):
         return reject("INVALID_PLAN")
 
     if not isinstance(resource["forceDestroy"], bool):
@@ -123,61 +117,37 @@ async def terraform_plan(request: Request):
         if not isinstance(key, str) or not isinstance(value, str):
             return reject("INVALID_PLAN")
 
-    # -------------------------------------------------
-    # 2. ENVIRONMENT_MISMATCH
-    # -------------------------------------------------
-
+    # 2. Environment
     if data["environment"] != WORKSPACE:
         return reject("ENVIRONMENT_MISMATCH")
 
-    # -------------------------------------------------
-    # 3. STATE_UNSAFE
-    # -------------------------------------------------
-
+    # 3. State safety
     if state["backend"] not in ALLOWED_BACKENDS:
         return reject("STATE_UNSAFE")
 
     if state["locked"] is not True:
         return reject("STATE_UNSAFE")
 
-    # -------------------------------------------------
-    # 4. UNPINNED_PROVIDER
-    # -------------------------------------------------
-
-    if data["providerVersion"] not in {
-        "6.2.1",
-        "= 6.2.1",
-        "~> 6.0",
-    }:
+    # 4. Provider pinning
+    if data["providerVersion"] not in ALLOWED_PROVIDERS:
         return reject("UNPINNED_PROVIDER")
 
-    # -------------------------------------------------
-    # 5. MISSING_LABELS
-    # -------------------------------------------------
-
-    labels = resource["labels"]
-
-    for key, expected in REQUIRED_LABELS.items():
-        if labels.get(key) != expected:
+    # 5. Required labels
+    for key, value in REQUIRED_LABELS.items():
+        if resource["labels"].get(key) != value:
             return reject("MISSING_LABELS")
 
-    # -------------------------------------------------
-    # 6. PLAINTEXT_SECRET
-    # -------------------------------------------------
-
+    # 6. Secret
     secret = resource["secret"]
 
     if secret is not None:
         if not secret.startswith("secret://"):
             return reject("PLAINTEXT_SECRET")
 
-        if secret == "secret://":
+        if len(secret) == len("secret://"):
             return reject("PLAINTEXT_SECRET")
 
-    # -------------------------------------------------
-    # 7. DELETE_NOT_APPROVED
-    # -------------------------------------------------
-
+    # 7. Delete approval
     if (
         resource["action"] == "delete"
         and resource["type"] in STATEFUL_TYPES
@@ -185,25 +155,14 @@ async def terraform_plan(request: Request):
     ):
         return reject("DELETE_NOT_APPROVED")
 
-    # -------------------------------------------------
-    # 8. FORCE_DESTROY
-    # -------------------------------------------------
-
+    # 8. Production bucket force destroy
     if (
-        data["environment"] == WORKSPACE
-        and resource["type"] == "storage_bucket"
+        resource["type"] == "storage_bucket"
         and resource["forceDestroy"] is True
     ):
         return reject("FORCE_DESTROY")
 
-    # -------------------------------------------------
-    # APPROVE
-    # -------------------------------------------------
-
     return JSONResponse(
-        {
-            "decision": "approve",
-            "reason": "APPROVE",
-        },
-        status_code=200,
+        {"decision": "approve", "reason": "APPROVE"},
+        status_code=200
     )

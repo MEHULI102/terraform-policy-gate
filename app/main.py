@@ -1,168 +1,199 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from urllib.parse import urlparse, unquote
+from html import unescape
+import re
 
 app = FastAPI()
 
-WORKSPACE = "prod-adao7e"
-
-REQUIRED_LABELS = {
-    "owner": "student-u2wzv",
-    "environment": "production",
-    "cost_center": "cc-icfh",
+ALLOWED_HOSTS = {
+    "cdn-itdr8us.example",
+    "app-c5o95mc.example",
 }
 
-ALLOWED_BACKENDS = {"gcs", "s3", "azurerm", "remote"}
-ALLOWED_ACTIONS = {"create", "update", "delete"}
-STATEFUL_TYPES = {"storage_bucket", "sql_database", "persistent_disk"}
-ALLOWED_PROVIDERS = {"6.2.1", "= 6.2.1", "~> 6.0"}
+CHANNELS = {"html", "markdown", "url", "sql", "shell"}
 
 
-def reject(reason):
-    return JSONResponse(
-        {"decision": "reject", "reason": reason},
-        status_code=200
+def result(safe, reason):
+    return {"safe": safe, "reason": reason}
+
+
+def decode_once(text):
+    decoded = unquote(text)
+    decoded = unescape(decoded)
+    decoded = re.sub(
+        r"\\u([0-9a-fA-F]{4})",
+        lambda m: chr(int(m.group(1), 16)),
+        decoded,
     )
+    return decoded
 
 
-@app.post("/terraform/plan")
-async def terraform_plan(request: Request):
+def dangerous_scheme(text):
+    if re.search(r"(?i)(javascript|data|vbscript)\s*:", text):
+        return True
 
-    # 1. Request must be valid JSON object
+    urls = extract_urls(text)
+
+    for value in urls:
+        parsed = urlparse(
+            "https:" + value if value.startswith("//") else value
+        )
+
+        if parsed.scheme and parsed.scheme.lower() not in {"http", "https"}:
+            return True
+
+    return False
+
+
+def extract_urls(text, channel):
+    if channel == "html":
+        return re.findall(
+            r"""(?i)(?:src|href)\s*=\s*["']([^"']+)["']""",
+            text,
+        )
+
+    if channel == "markdown":
+        return re.findall(r"""\]\(([^)]+)\)""", text)
+
+    if channel == "url":
+        return [text.strip()]
+
+    return []
+
+
+def external_exfil(text, channel):
+    for value in extract_urls(text, channel):
+        value = value.strip()
+
+        if value.startswith("//"):
+            value = "https:" + value
+
+        parsed = urlparse(value)
+
+        if parsed.scheme in {"http", "https"}:
+            if parsed.hostname not in ALLOWED_HOSTS:
+                return True
+
+    return False
+
+
+def html_check(text):
+    if re.search(
+        r"(?is)<\s*(script|iframe|object|embed)\b",
+        text,
+    ):
+        return "SCRIPT_TAG"
+
+    if re.search(
+        r"(?i)\bon[a-zA-Z0-9_-]+\s*=",
+        text,
+    ):
+        return "EVENT_HANDLER"
+
+    if dangerous_scheme(text):
+        return "DANGEROUS_SCHEME"
+
+    if external_exfil(text, "html"):
+        return "EXTERNAL_EXFIL"
+
+    return None
+
+
+def markdown_check(text):
+    if dangerous_scheme(text):
+        return "DANGEROUS_SCHEME"
+
+    if external_exfil(text, "markdown"):
+        return "EXTERNAL_EXFIL"
+
+    return None
+
+
+def url_check(text):
+    if dangerous_scheme(text):
+        return "DANGEROUS_SCHEME"
+
+    if external_exfil(text, "url"):
+        return "EXTERNAL_EXFIL"
+
+    return None
+
+
+def sql_check(text):
+    if re.search(
+        r"""(?i)('|")|;|--|/\*|\bunion\b|\bor\s+1\s*=\s*1\b""",
+        text,
+    ):
+        return "SQL_METACHAR"
+
+    return None
+
+
+def shell_check(text):
+    if re.search(r"""[;&|`<>]|\$\(|\$\{""", text):
+        return "SHELL_METACHAR"
+
+    return None
+
+
+@app.post("/sanitize-output")
+async def sanitize_output(request: Request):
+    # Rule 1: schema
     try:
         data = await request.json()
     except Exception:
-        return reject("INVALID_PLAN")
+        return JSONResponse(result(False, "INVALID_SCHEMA"))
 
     if not isinstance(data, dict):
-        return reject("INVALID_PLAN")
+        return JSONResponse(result(False, "INVALID_SCHEMA"))
 
-    # Required top-level fields
-    required = {
-        "environment",
-        "state",
-        "providerVersion",
-        "destroyApproved",
-        "resource",
-    }
+    if set(data.keys()) != {"channel", "output"}:
+        return JSONResponse(result(False, "INVALID_SCHEMA"))
 
-    if not required.issubset(data.keys()):
-        return reject("INVALID_PLAN")
+    channel = data.get("channel")
+    output = data.get("output")
 
-    # Top-level types
-    if not isinstance(data["environment"], str):
-        return reject("INVALID_PLAN")
+    if channel not in CHANNELS:
+        return JSONResponse(result(False, "INVALID_SCHEMA"))
 
-    if not isinstance(data["state"], dict):
-        return reject("INVALID_PLAN")
+    if not isinstance(output, str):
+        return JSONResponse(result(False, "INVALID_SCHEMA"))
 
-    if not isinstance(data["providerVersion"], str):
-        return reject("INVALID_PLAN")
+    if len(output) > 20000:
+        return JSONResponse(result(False, "INVALID_SCHEMA"))
 
-    if not isinstance(data["destroyApproved"], bool):
-        return reject("INVALID_PLAN")
+    # Rule 2: encoded payload
+    decoded = decode_once(output)
 
-    if not isinstance(data["resource"], dict):
-        return reject("INVALID_PLAN")
+    if decoded != output:
+        if channel == "html":
+            reason = html_check(decoded)
+        elif channel == "markdown":
+            reason = markdown_check(decoded)
+        elif channel == "url":
+            reason = url_check(decoded)
+        elif channel == "sql":
+            reason = sql_check(decoded)
+        else:
+            reason = shell_check(decoded)
 
-    state = data["state"]
-    resource = data["resource"]
+        if reason:
+            return JSONResponse(result(False, "ENCODED_PAYLOAD"))
 
-    # State schema
-    if "backend" not in state or "locked" not in state:
-        return reject("INVALID_PLAN")
+    # Rule 3: original output
+    if channel == "html":
+        reason = html_check(output)
+    elif channel == "markdown":
+        reason = markdown_check(output)
+    elif channel == "url":
+        reason = url_check(output)
+    elif channel == "sql":
+        reason = sql_check(output)
+    else:
+        reason = shell_check(output)
 
-    if not isinstance(state["backend"], str):
-        return reject("INVALID_PLAN")
+    if reason:
+        return JSONResponse(result(False, reason))
 
-    if not isinstance(state["locked"], bool):
-        return reject("INVALID_PLAN")
-
-    # Resource required fields
-    resource_required = {
-        "address",
-        "type",
-        "action",
-        "labels",
-        "secret",
-        "forceDestroy",
-    }
-
-    if not resource_required.issubset(resource.keys()):
-        return reject("INVALID_PLAN")
-
-    # Resource types
-    if not isinstance(resource["address"], str):
-        return reject("INVALID_PLAN")
-
-    if not isinstance(resource["type"], str):
-        return reject("INVALID_PLAN")
-
-    if not isinstance(resource["action"], str):
-        return reject("INVALID_PLAN")
-
-    if resource["action"] not in ALLOWED_ACTIONS:
-        return reject("INVALID_PLAN")
-
-    if not isinstance(resource["labels"], dict):
-        return reject("INVALID_PLAN")
-
-    if resource["secret"] is not None and not isinstance(resource["secret"], str):
-        return reject("INVALID_PLAN")
-
-    if not isinstance(resource["forceDestroy"], bool):
-        return reject("INVALID_PLAN")
-
-    # Labels must contain string values
-    for key, value in resource["labels"].items():
-        if not isinstance(key, str) or not isinstance(value, str):
-            return reject("INVALID_PLAN")
-
-    # 2. Environment
-    if data["environment"] != WORKSPACE:
-        return reject("ENVIRONMENT_MISMATCH")
-
-    # 3. State safety
-    if state["backend"] not in ALLOWED_BACKENDS:
-        return reject("STATE_UNSAFE")
-
-    if state["locked"] is not True:
-        return reject("STATE_UNSAFE")
-
-    # 4. Provider pinning
-    if data["providerVersion"] not in ALLOWED_PROVIDERS:
-        return reject("UNPINNED_PROVIDER")
-
-    # 5. Required labels
-    for key, value in REQUIRED_LABELS.items():
-        if resource["labels"].get(key) != value:
-            return reject("MISSING_LABELS")
-
-    # 6. Secret
-    secret = resource["secret"]
-
-    if secret is not None:
-        if not secret.startswith("secret://"):
-            return reject("PLAINTEXT_SECRET")
-
-        if len(secret) == len("secret://"):
-            return reject("PLAINTEXT_SECRET")
-
-    # 7. Delete approval
-    if (
-        resource["action"] == "delete"
-        and resource["type"] in STATEFUL_TYPES
-        and data["destroyApproved"] is not True
-    ):
-        return reject("DELETE_NOT_APPROVED")
-
-    # 8. Production bucket force destroy
-    if (
-        resource["type"] == "storage_bucket"
-        and resource["forceDestroy"] is True
-    ):
-        return reject("FORCE_DESTROY")
-
-    return JSONResponse(
-        {"decision": "approve", "reason": "APPROVE"},
-        status_code=200
-    )
+    return JSONResponse(result(True, "SAFE"))

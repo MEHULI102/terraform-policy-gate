@@ -12,27 +12,39 @@ REQUIRED_LABELS = {
 }
 
 ALLOWED_BACKENDS = {"gcs", "s3", "azurerm", "remote"}
-STATEFUL_TYPES = {"storage_bucket", "sql_database", "persistent_disk"}
+STATEFUL_TYPES = {
+    "storage_bucket",
+    "sql_database",
+    "persistent_disk",
+}
+
+VALID_ACTIONS = {"create", "update", "delete"}
+
+
+def reject(reason):
+    return JSONResponse(
+        {"decision": "reject", "reason": reason},
+        status_code=200,
+    )
 
 
 @app.post("/terraform/plan")
 async def terraform_plan(request: Request):
+
+    # -------------------------------------------------
+    # 1. INVALID_PLAN
+    # -------------------------------------------------
+
     try:
         data = await request.json()
     except Exception:
-        return JSONResponse(
-            {"decision": "reject", "reason": "INVALID_PLAN"},
-            status_code=200
-        )
+        return reject("INVALID_PLAN")
 
-    # 1. Top-level and nested type validation
     if not isinstance(data, dict):
-        return JSONResponse(
-            {"decision": "reject", "reason": "INVALID_PLAN"},
-            status_code=200
-        )
+        return reject("INVALID_PLAN")
 
-    required_top = {
+    # Required top-level fields
+    required = {
         "environment",
         "state",
         "providerVersion",
@@ -40,140 +52,158 @@ async def terraform_plan(request: Request):
         "resource",
     }
 
-    if not required_top.issubset(data.keys()):
-        return JSONResponse(
-            {"decision": "reject", "reason": "INVALID_PLAN"},
-            status_code=200
-        )
+    if not required.issubset(data):
+        return reject("INVALID_PLAN")
 
+    # Top-level types
     if not isinstance(data["environment"], str):
-        return JSONResponse(
-            {"decision": "reject", "reason": "INVALID_PLAN"},
-            status_code=200
-        )
-
-    if not isinstance(data["state"], dict):
-        return JSONResponse(
-            {"decision": "reject", "reason": "INVALID_PLAN"},
-            status_code=200
-        )
+        return reject("INVALID_PLAN")
 
     if not isinstance(data["providerVersion"], str):
-        return JSONResponse(
-            {"decision": "reject", "reason": "INVALID_PLAN"},
-            status_code=200
-        )
+        return reject("INVALID_PLAN")
 
     if not isinstance(data["destroyApproved"], bool):
-        return JSONResponse(
-            {"decision": "reject", "reason": "INVALID_PLAN"},
-            status_code=200
-        )
+        return reject("INVALID_PLAN")
+
+    if not isinstance(data["state"], dict):
+        return reject("INVALID_PLAN")
 
     if not isinstance(data["resource"], dict):
-        return JSONResponse(
-            {"decision": "reject", "reason": "INVALID_PLAN"},
-            status_code=200
-        )
+        return reject("INVALID_PLAN")
 
     state = data["state"]
     resource = data["resource"]
 
-    if not isinstance(state.get("backend"), str):
-        return JSONResponse(
-            {"decision": "reject", "reason": "INVALID_PLAN"},
-            status_code=200
-        )
+    # State fields must exist and have correct types
+    if "backend" not in state or "locked" not in state:
+        return reject("INVALID_PLAN")
 
-    if not isinstance(state.get("locked"), bool):
-        return JSONResponse(
-            {"decision": "reject", "reason": "INVALID_PLAN"},
-            status_code=200
-        )
+    if not isinstance(state["backend"], str):
+        return reject("INVALID_PLAN")
 
-    for field in ["address", "type", "action"]:
-        if not isinstance(resource.get(field), str):
-            return JSONResponse(
-                {"decision": "reject", "reason": "INVALID_PLAN"},
-                status_code=200
-            )
+    if not isinstance(state["locked"], bool):
+        return reject("INVALID_PLAN")
 
-    if not isinstance(resource.get("labels"), dict):
-        return JSONResponse(
-            {"decision": "reject", "reason": "INVALID_PLAN"},
-            status_code=200
-        )
+    # Resource fields must exist
+    resource_required = {
+        "address",
+        "type",
+        "action",
+        "labels",
+        "secret",
+        "forceDestroy",
+    }
 
-    if resource.get("secret") is not None and not isinstance(resource.get("secret"), str):
-        return JSONResponse(
-            {"decision": "reject", "reason": "INVALID_PLAN"},
-            status_code=200
-        )
+    if not resource_required.issubset(resource):
+        return reject("INVALID_PLAN")
 
-    if not isinstance(resource.get("forceDestroy"), bool):
-        return JSONResponse(
-            {"decision": "reject", "reason": "INVALID_PLAN"},
-            status_code=200
-        )
+    # Resource types
+    if not isinstance(resource["address"], str):
+        return reject("INVALID_PLAN")
 
-    # 2. Environment
+    if not isinstance(resource["type"], str):
+        return reject("INVALID_PLAN")
+
+    if not isinstance(resource["action"], str):
+        return reject("INVALID_PLAN")
+
+    if not isinstance(resource["labels"], dict):
+        return reject("INVALID_PLAN")
+
+    if resource["secret"] is not None and not isinstance(
+        resource["secret"], str
+    ):
+        return reject("INVALID_PLAN")
+
+    if not isinstance(resource["forceDestroy"], bool):
+        return reject("INVALID_PLAN")
+
+    # Labels must contain string values
+    for key, value in resource["labels"].items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            return reject("INVALID_PLAN")
+
+    # -------------------------------------------------
+    # 2. ENVIRONMENT_MISMATCH
+    # -------------------------------------------------
+
     if data["environment"] != WORKSPACE:
-        return JSONResponse(
-            {"decision": "reject", "reason": "ENVIRONMENT_MISMATCH"}
-        )
+        return reject("ENVIRONMENT_MISMATCH")
 
-    # 3. State
-    if state["backend"] not in ALLOWED_BACKENDS or state["locked"] is not True:
-        return JSONResponse(
-            {"decision": "reject", "reason": "STATE_UNSAFE"}
-        )
+    # -------------------------------------------------
+    # 3. STATE_UNSAFE
+    # -------------------------------------------------
 
-    # 4. Provider pinning
-    provider = data["providerVersion"]
+    if state["backend"] not in ALLOWED_BACKENDS:
+        return reject("STATE_UNSAFE")
 
-    if provider not in {"6.2.1", "= 6.2.1", "~> 6.0"}:
-        return JSONResponse(
-            {"decision": "reject", "reason": "UNPINNED_PROVIDER"}
-        )
+    if state["locked"] is not True:
+        return reject("STATE_UNSAFE")
 
-    # 5. Labels
+    # -------------------------------------------------
+    # 4. UNPINNED_PROVIDER
+    # -------------------------------------------------
+
+    if data["providerVersion"] not in {
+        "6.2.1",
+        "= 6.2.1",
+        "~> 6.0",
+    }:
+        return reject("UNPINNED_PROVIDER")
+
+    # -------------------------------------------------
+    # 5. MISSING_LABELS
+    # -------------------------------------------------
+
     labels = resource["labels"]
 
-    for key, value in REQUIRED_LABELS.items():
-        if labels.get(key) != value:
-            return JSONResponse(
-                {"decision": "reject", "reason": "MISSING_LABELS"}
-            )
+    for key, expected in REQUIRED_LABELS.items():
+        if labels.get(key) != expected:
+            return reject("MISSING_LABELS")
 
-    # 6. Secret
-    secret = resource.get("secret")
+    # -------------------------------------------------
+    # 6. PLAINTEXT_SECRET
+    # -------------------------------------------------
+
+    secret = resource["secret"]
 
     if secret is not None:
-        if not secret.startswith("secret://") or len(secret) <= len("secret://"):
-            return JSONResponse(
-                {"decision": "reject", "reason": "PLAINTEXT_SECRET"}
-            )
+        if not secret.startswith("secret://"):
+            return reject("PLAINTEXT_SECRET")
 
-    # 7. Delete approval
+        if secret == "secret://":
+            return reject("PLAINTEXT_SECRET")
+
+    # -------------------------------------------------
+    # 7. DELETE_NOT_APPROVED
+    # -------------------------------------------------
+
     if (
         resource["action"] == "delete"
         and resource["type"] in STATEFUL_TYPES
         and data["destroyApproved"] is not True
     ):
-        return JSONResponse(
-            {"decision": "reject", "reason": "DELETE_NOT_APPROVED"}
-        )
+        return reject("DELETE_NOT_APPROVED")
 
-    # 8. Force destroy
+    # -------------------------------------------------
+    # 8. FORCE_DESTROY
+    # -------------------------------------------------
+
     if (
         data["environment"] == WORKSPACE
         and resource["type"] == "storage_bucket"
         and resource["forceDestroy"] is True
     ):
-        return JSONResponse(
-            {"decision": "reject", "reason": "FORCE_DESTROY"}
-        )
+        return reject("FORCE_DESTROY")
+
+    # -------------------------------------------------
+    # APPROVE
+    # -------------------------------------------------
 
     return JSONResponse(
-        {"decision": "approve", "reason": "APPROVE"}
+        {
+            "decision": "approve",
+            "reason": "APPROVE",
+        },
+        status_code=200,
     )
